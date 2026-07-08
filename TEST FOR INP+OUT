@@ -1,0 +1,461 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+
+// -----------------------------------------------------------------------------
+// Wi-Fi configuration
+// -----------------------------------------------------------------------------
+// Set your Wi-Fi credentials here. Leave both blank to start in Access Point mode.
+const char* wifiSsid = "";
+const char* wifiPassword = "";
+
+const char* apSsid = "ESP32PLC-Test";
+const char* apPassword = "12345678";
+
+// -----------------------------------------------------------------------------
+// PLC pin mapping
+// -----------------------------------------------------------------------------
+const uint8_t inputPins[8]  = {33, 25, 36, 39, 34, 35, 32, 26};
+const uint8_t outputPins[8] = {21, 19, 18, 5, 16, 4, 2, 15};
+const char* inputLabels[8]  = {"I1", "I2", "I3", "I4", "I5", "I6", "I7", "I8"};
+const char* outputLabels[8] = {"S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8"};
+bool outputStates[8] = {false, false, false, false, false, false, false, false};
+
+WebServer server(80);
+
+enum NetworkMode {
+  MODE_UNKNOWN,
+  MODE_STA,
+  MODE_AP,
+  MODE_CONNECTING
+};
+
+NetworkMode networkMode = MODE_UNKNOWN;
+unsigned long connectStartMs = 0;
+const unsigned long connectTimeoutMs = 20000;
+
+// -----------------------------------------------------------------------------
+// Setup helper functions
+// -----------------------------------------------------------------------------
+void initializeInputs() {
+  for (uint8_t i = 0; i < 8; i++) {
+    pinMode(inputPins[i], INPUT);
+  }
+}
+
+void initializeOutputs() {
+  for (uint8_t i = 0; i < 8; i++) {
+    pinMode(outputPins[i], OUTPUT);
+    digitalWrite(outputPins[i], LOW);
+    outputStates[i] = false;
+  }
+}
+
+void setOutputState(uint8_t index, bool state) {
+  if (index >= 8) {
+    return;
+  }
+  outputStates[index] = state;
+  digitalWrite(outputPins[index], state ? HIGH : LOW);
+}
+
+// -----------------------------------------------------------------------------
+// Wi-Fi and AP management
+// -----------------------------------------------------------------------------
+void startAccessPoint() {
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  delay(50);
+  WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+  WiFi.softAP(apSsid, apPassword);
+  networkMode = MODE_AP;
+
+  Serial.println("Access Point mode started.");
+  Serial.print("AP IP address: ");
+  Serial.println(WiFi.softAPIP());
+}
+
+void startWiFi() {
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  delay(50);
+  WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(wifiSsid, wifiPassword);
+  networkMode = MODE_CONNECTING;
+  connectStartMs = millis();
+
+  Serial.println("Connecting to Wi-Fi...");
+}
+
+void updateWiFiStatus() {
+  if (networkMode != MODE_CONNECTING) {
+    return;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    networkMode = MODE_STA;
+    Serial.println("Wi-Fi connected.");
+    Serial.print("Local IP address: ");
+    Serial.println(WiFi.localIP());
+    return;
+  }
+
+  if (millis() - connectStartMs >= connectTimeoutMs) {
+    Serial.println("Wi-Fi connection timed out.");
+    Serial.println("Falling back to Access Point mode.");
+    startAccessPoint();
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Web UI generation
+// -----------------------------------------------------------------------------
+String buildWebPage() {
+  String page = R"HTML(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ESP32 PLC Tester</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      --bg: #08101e;
+      --panel: rgba(15, 23, 42, 0.96);
+      --border: rgba(148, 163, 184, 0.16);
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --accent: #38bdf8;
+      --green: #22c55e;
+      --red: #f97316;
+      --surface: #111827;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: radial-gradient(circle at top, #1e293b 0%, #020617 55%, #020617 100%);
+      color: var(--text);
+    }
+    .container {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 20px;
+      display: grid;
+      gap: 20px;
+    }
+    .hero, .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 24px;
+      padding: 24px;
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.22);
+    }
+    .hero h1 {
+      margin: 0 0 12px;
+      font-size: clamp(2rem, 3vw, 2.6rem);
+    }
+    .hero p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.7;
+    }
+    .status-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 14px;
+      margin-top: 20px;
+    }
+    .status-item {
+      background: var(--surface);
+      border: 1px solid rgba(148, 163, 184, 0.08);
+      border-radius: 18px;
+      padding: 18px;
+    }
+    .status-item .label {
+      display: block;
+      color: var(--muted);
+      font-size: 0.85rem;
+      margin-bottom: 8px;
+    }
+    .status-item .value {
+      font-size: 1.15rem;
+      font-weight: 700;
+      color: var(--text);
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 20px;
+    }
+    .section-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+    .section-header h2 {
+      margin: 0;
+      font-size: 1.1rem;
+      color: #cbd5e1;
+    }
+    .list {
+      display: grid;
+      gap: 12px;
+    }
+    .row {
+      display: grid;
+      grid-template-columns: 1fr auto auto;
+      gap: 12px;
+      align-items: center;
+      padding: 14px 16px;
+      background: #111827;
+      border: 1px solid rgba(148, 163, 184, 0.08);
+      border-radius: 16px;
+    }
+    .row strong {
+      font-size: 1rem;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 80px;
+      border-radius: 999px;
+      padding: 10px 14px;
+      font-weight: 700;
+      text-transform: uppercase;
+      font-size: 0.85rem;
+    }
+    .badge.on {
+      background: rgba(34, 197, 94, 0.16);
+      color: #86efac;
+    }
+    .badge.off {
+      background: rgba(248, 113, 113, 0.16);
+      color: #fecaca;
+    }
+    .btn-group {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      justify-content: flex-end;
+    }
+    button {
+      border: none;
+      border-radius: 14px;
+      padding: 10px 16px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: transform 0.12s ease, filter 0.12s ease;
+    }
+    button:hover { transform: translateY(-1px); }
+    .btn-on { background: #16a34a; color: white; }
+    .btn-off { background: #dc2626; color: white; }
+    @media (max-width: 960px) {
+      .grid { grid-template-columns: 1fr; }
+      .status-grid { grid-template-columns: 1fr 1fr; }
+    }
+    @media (max-width: 640px) {
+      .status-grid { grid-template-columns: 1fr; }
+      .row { grid-template-columns: 1fr; }
+      .btn-group { justify-content: flex-start; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <section class="hero">
+      <div>
+        <h1>ESP32 Mini PLC Hardware Tester</h1>
+        <p>Monitor the 8 digital inputs and control the 8 digital outputs from any browser. This page refreshes automatically and is built for quick PLC hardware verification.</p>
+      </div>
+      <div class="status-grid">
+        <div class="status-item"><span class="label">ESP32 IP</span><span class="value" id="ipAddress">--</span></div>
+        <div class="status-item"><span class="label">Wi-Fi Status</span><span class="value" id="wifiStatus">--</span></div>
+        <div class="status-item"><span class="label">System Uptime</span><span class="value" id="uptime">--</span></div>
+        <div class="status-item"><span class="label">Free Heap</span><span class="value" id="freeHeap">--</span></div>
+      </div>
+    </section>
+
+    <section class="grid">
+      <section class="panel">
+        <div class="section-header"><h2>Digital Inputs</h2></div>
+        <div class="list" id="inputList"></div>
+      </section>
+      <section class="panel">
+        <div class="section-header"><h2>Digital Outputs</h2></div>
+        <div class="list" id="outputList"></div>
+      </section>
+    </section>
+  </div>
+
+  <script>
+    const ipAddress = document.getElementById('ipAddress');
+    const wifiStatus = document.getElementById('wifiStatus');
+    const uptime = document.getElementById('uptime');
+    const freeHeap = document.getElementById('freeHeap');
+    const inputList = document.getElementById('inputList');
+    const outputList = document.getElementById('outputList');
+
+    function createInputRow(label, state) {
+      const row = document.createElement('div');
+      row.className = 'row';
+      row.innerHTML = `
+        <div><strong>${label}</strong></div>
+        <div class="badge ${state ? 'on' : 'off'}">${state ? 'ON' : 'OFF'}</div>
+      `;
+      return row;
+    }
+
+    function createOutputRow(label, state, index) {
+      const row = document.createElement('div');
+      row.className = 'row';
+      row.innerHTML = `
+        <div><strong>${label}</strong></div>
+        <div class="badge ${state ? 'on' : 'off'}">${state ? 'ON' : 'OFF'}</div>
+        <div class="btn-group">
+          <button class="btn btn-on" onclick="setOutput(${index}, 1)">ON</button>
+          <button class="btn btn-off" onclick="setOutput(${index}, 0)">OFF</button>
+        </div>
+      `;
+      return row;
+    }
+
+    function updateDashboard(data) {
+      ipAddress.textContent = data.ip;
+      wifiStatus.textContent = data.wifi;
+      uptime.textContent = data.uptime;
+      freeHeap.textContent = data.heap + ' bytes';
+
+      inputList.innerHTML = '';
+      data.inputs.forEach(input => inputList.appendChild(createInputRow(input.label, input.state)));
+
+      outputList.innerHTML = '';
+      data.outputs.forEach((output, index) => outputList.appendChild(createOutputRow(output.label, output.state, index)));
+    }
+
+    function fetchStatus() {
+      fetch('/status')
+        .then(response => response.json())
+        .then(updateDashboard)
+        .catch(() => {
+          wifiStatus.textContent = 'Offline';
+        });
+    }
+
+    function setOutput(index, state) {
+      fetch(`/control?output=${index}&state=${state}`)
+        .then(() => fetchStatus());
+    }
+
+    fetchStatus();
+    setInterval(fetchStatus, 200);
+  </script>
+</body>
+</html>
+)HTML";
+
+  return page;
+}
+
+void handleRoot() {
+  server.send(200, "text/html", buildWebPage());
+}
+
+void handleStatus() {
+  String response = "{";
+  response += "\"ip\":\"";
+  response += (networkMode == MODE_AP) ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
+  response += "\",";
+
+  response += "\"wifi\":\"";
+  switch (networkMode) {
+    case MODE_STA:
+      response += "Connected";
+      break;
+    case MODE_CONNECTING:
+      response += "Connecting";
+      break;
+    case MODE_AP:
+      response += "Access Point";
+      break;
+    default:
+      response += "Unknown";
+      break;
+  }
+  response += "\",";
+
+  response += "\"uptime\":" + String(millis() / 1000) + ",";
+  response += "\"heap\":" + String(ESP.getFreeHeap()) + ",";
+
+  response += "\"inputs\": [";
+  for (uint8_t i = 0; i < 8; i++) {
+    bool state = digitalRead(inputPins[i]) == HIGH;
+    response += "{\"label\":\"" + String(inputLabels[i]) + "\",\"state\":" + String(state ? 1 : 0) + "}";
+    if (i < 7) response += ",";
+  }
+  response += "],";
+
+  response += "\"outputs\": [";
+  for (uint8_t i = 0; i < 8; i++) {
+    response += "{\"label\":\"" + String(outputLabels[i]) + "\",\"state\":" + String(outputStates[i] ? 1 : 0) + "}";
+    if (i < 7) response += ",";
+  }
+  response += "]}";
+
+  server.send(200, "application/json", response);
+}
+
+void handleControl() {
+  if (!server.hasArg("output") || !server.hasArg("state")) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"Missing parameters\"}");
+    return;
+  }
+
+  int index = server.arg("output").toInt();
+  int state = server.arg("state").toInt();
+
+  if (index < 0 || index > 7) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid output index\"}");
+    return;
+  }
+
+  setOutputState(index, state != 0);
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(10);
+  Serial.println();
+  Serial.println("ESP32 Mini PLC Hardware Test Utility");
+
+  initializeInputs();
+  initializeOutputs();
+
+  if (strlen(wifiSsid) > 0 && strlen(wifiPassword) > 0) {
+    startWiFi();
+  } else {
+    startAccessPoint();
+  }
+
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/status", HTTP_GET, handleStatus);
+  server.on("/control", HTTP_GET, handleControl);
+  server.begin();
+
+  Serial.println("Web server started.");
+}
+
+void loop() {
+  server.handleClient();
+  updateWiFiStatus();
+}
