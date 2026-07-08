@@ -1,0 +1,315 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+
+// -----------------------------------------------------------------------------
+// Wi-Fi configuration
+// -----------------------------------------------------------------------------
+// Leave these empty to start in Access Point mode.
+const char* wifiSsid = "hotspot";
+const char* wifiPassword = "12345678";
+
+const char* apSsid = "ESP32-Controls";
+const char* apPassword = "12345678";
+
+// -----------------------------------------------------------------------------
+// Output mapping for the required GPIOs
+// -----------------------------------------------------------------------------
+const uint8_t outputPins[] = {21, 19, 18, 5, 16, 4, 2, 15};
+const char* outputNames[] = {"S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8"};
+
+const uint8_t outputCount = sizeof(outputPins) / sizeof(outputPins[0]);
+bool outputStates[outputCount];
+
+WebServer server(80);
+
+enum WiFiState {
+  WIFI_IDLE,
+  WIFI_CONNECTING,
+  WIFI_CONNECTED,
+  WIFI_AP_READY
+};
+
+WiFiState wifiState = WIFI_IDLE;
+unsigned long wifiStartTime = 0;
+const unsigned long wifiTimeoutMs = 20000;
+
+// -----------------------------------------------------------------------------
+// Helper functions
+// -----------------------------------------------------------------------------
+void initializeOutputs() {
+  for (uint8_t i = 0; i < outputCount; i++) {
+    pinMode(outputPins[i], OUTPUT);
+    digitalWrite(outputPins[i], LOW);
+    outputStates[i] = false;
+  }
+}
+
+void setOutputState(uint8_t index, bool state) {
+  if (index >= outputCount) {
+    return;
+  }
+
+  outputStates[index] = state;
+  digitalWrite(outputPins[index], state ? HIGH : LOW);
+}
+
+void startAccessPoint() {
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+  WiFi.softAP(apSsid, apPassword);
+  wifiState = WIFI_AP_READY;
+
+  Serial.println("Access Point started.");
+  Serial.print("AP IP: ");
+  Serial.println(WiFi.softAPIP());
+}
+
+void connectToWiFi() {
+  if (strlen(wifiSsid) == 0) {
+    startAccessPoint();
+    return;
+  }
+
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(wifiSsid, wifiPassword);
+  wifiState = WIFI_CONNECTING;
+  wifiStartTime = millis();
+
+  Serial.println("Connecting to Wi-Fi...");
+}
+
+void updateWiFiStatus() {
+  if (wifiState == WIFI_CONNECTING) {
+    if (WiFi.status() == WL_CONNECTED) {
+      wifiState = WIFI_CONNECTED;
+      Serial.println("Wi-Fi connected.");
+      Serial.print("IP Address: ");
+      Serial.println(WiFi.localIP());
+    } else if (millis() - wifiStartTime >= wifiTimeoutMs) {
+      Serial.println("Wi-Fi connection timed out, switching to Access Point mode.");
+      startAccessPoint();
+    }
+  }
+}
+
+String buildWebPage() {
+  String html = R"HTML(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ESP32 Output Controller</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #0f172a;
+      --card: #111827;
+      --text: #f9fafb;
+      --muted: #9ca3af;
+      --on: #10b981;
+      --off: #ef4444;
+      --btn: #374151;
+      --border: #4b5563;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Arial, Helvetica, sans-serif;
+      background: linear-gradient(135deg, #111827, #1f2937);
+      color: var(--text);
+      padding: 20px;
+    }
+    .container {
+      max-width: 900px;
+      margin: 0 auto;
+      background: rgba(17, 24, 39, 0.95);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 20px;
+      box-shadow: 0 15px 40px rgba(0,0,0,0.25);
+    }
+    .header {
+      text-align: center;
+      margin-bottom: 20px;
+    }
+    .header h1 { margin: 0 0 8px; font-size: 1.6rem; }
+    .ip { color: #93c5fd; font-weight: bold; word-break: break-all; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+    }
+    .card {
+      background: #1f2937;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 16px;
+    }
+    .card h2 { margin: 0 0 10px; font-size: 1.05rem; }
+    .status {
+      display: inline-block;
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-size: 0.9rem;
+      font-weight: bold;
+      margin-bottom: 12px;
+    }
+    .status.on { background: rgba(16,185,129,0.2); color: var(--on); }
+    .status.off { background: rgba(239,68,68,0.2); color: var(--off); }
+    .buttons { display: flex; gap: 8px; }
+    button {
+      flex: 1;
+      border: none;
+      border-radius: 10px;
+      color: white;
+      padding: 10px 12px;
+      font-size: 0.95rem;
+      font-weight: bold;
+      cursor: pointer;
+      transition: transform 0.15s ease, filter 0.15s ease;
+    }
+    button:hover { transform: translateY(-1px); filter: brightness(1.1); }
+    .on-btn { background: var(--on); }
+    .off-btn { background: var(--off); }
+    .muted { color: var(--muted); font-size: 0.85rem; }
+    @media (max-width: 640px) {
+      .grid { grid-template-columns: 1fr; }
+      body { padding: 12px; }
+      .container { padding: 14px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>ESP32 Output Controller</h1>
+      <div class="ip" id="ipLabel">IP: --</div>
+    </div>
+
+    <div class="grid" id="outputGrid"></div>
+  </div>
+
+  <script>
+    const outputGrid = document.getElementById('outputGrid');
+    const ipLabel = document.getElementById('ipLabel');
+
+    function createCard(index, name, gpio, state) {
+      const card = document.createElement('div');
+      card.className = 'card';
+      card.innerHTML = `
+        <h2>${name}</h2>
+        <div class="status ${state ? 'on' : 'off'}">${state ? 'ON' : 'OFF'}</div>
+        <div class="buttons">
+          <button class="on-btn" onclick="sendCommand(${index}, 1)">ON</button>
+          <button class="off-btn" onclick="sendCommand(${index}, 0)">OFF</button>
+        </div>
+        <div class="muted">GPIO ${gpio}</div>
+      `;
+      return card;
+    }
+
+    function renderOutputs(data) {
+      outputGrid.innerHTML = '';
+      for (let i = 0; i < data.outputs.length; i++) {
+        outputGrid.appendChild(createCard(i, data.outputs[i].name, data.outputs[i].gpio, data.outputs[i].state));
+      }
+    }
+
+    function fetchStatus() {
+      fetch('/status')
+        .then(response => response.json())
+        .then(data => {
+          renderOutputs(data);
+          ipLabel.textContent = 'IP: ' + data.ip;
+        })
+        .catch(() => {
+          ipLabel.textContent = 'IP: connecting...';
+        });
+    }
+
+    function sendCommand(index, state) {
+      fetch('/control?output=' + index + '&state=' + state)
+        .then(() => fetchStatus());
+    }
+
+    fetchStatus();
+    setInterval(fetchStatus, 1000);
+  </script>
+</body>
+</html>
+)HTML";
+
+  return html;
+}
+
+void handleRoot() {
+  server.send(200, "text/html", buildWebPage());
+}
+
+void handleStatus() {
+  String payload = "{\"ip\":\"";
+  payload += (WiFi.getMode() == WIFI_AP) ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
+  payload += "\",\"outputs\":[";
+
+  for (uint8_t i = 0; i < outputCount; i++) {
+    payload += "{\"name\":\"";
+    payload += outputNames[i];
+    payload += "\",\"gpio\":";
+    payload += outputPins[i];
+    payload += ",\"state\":";
+    payload += outputStates[i] ? "1" : "0";
+    payload += "}";
+
+    if (i < outputCount - 1) {
+      payload += ",";
+    }
+  }
+
+  payload += "]}";
+  server.send(200, "application/json", payload);
+}
+
+void handleControl() {
+  if (!server.hasArg("output") || !server.hasArg("state")) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"missing parameters\"}");
+    return;
+  }
+
+  int index = server.arg("output").toInt();
+  int state = server.arg("state").toInt();
+
+  if (index >= 0 && index < outputCount) {
+    setOutputState(index, state != 0);
+    server.send(200, "application/json", "{\"ok\":true}");
+  } else {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"invalid output\"}");
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  initializeOutputs();
+
+  connectToWiFi();
+
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/status", HTTP_GET, handleStatus);
+  server.on("/control", HTTP_GET, handleControl);
+  server.begin();
+
+  Serial.println("Web server started.");
+}
+
+void loop() {
+  server.handleClient();
+  updateWiFiStatus();
+}
